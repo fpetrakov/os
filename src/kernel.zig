@@ -11,6 +11,7 @@ export fn kernel_main() noreturn {
     @memset(bss_start[0..bss_len], 0);
 
     common.printf("\n\nHello {s}\n", .{"World!"});
+    common.printf("1 + 2 = {d}\n", .{3});
 
     while (true) {
         asm volatile ("wfi");
