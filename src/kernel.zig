@@ -1,21 +1,19 @@
 const std = @import("std");
 const common = @import("common.zig");
 
-extern var __bss: u8;
-extern var __bss_end: u8;
-extern const __stack_top: u8;
+const bss = @extern([*]u8, .{ .name = "__bss" });
+const bss_end = @extern([*]u8, .{ .name = "__bss_end" });
+const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
 
 export fn kernel_main() noreturn {
-    const bss_start: [*]u8 = @ptrCast(&__bss);
-    const bss_len = @intFromPtr(&__bss_end) - @intFromPtr(&__bss);
-    @memset(bss_start[0..bss_len], 0);
+    const bss_len = @intFromPtr(bss_end) - @intFromPtr(bss);
+    @memset(bss[0..bss_len], 0);
 
-    common.printf("\n\nHello {s}\n", .{"World!"});
-    common.printf("1 + 2 = {d}\n", .{3});
+    common.printf("\n\nHello {s}\n", .{"Kernel!"});
+    common.panic("booted!", null, null);
+    common.printf("unreachable here!\n", .{});
 
-    while (true) {
-        asm volatile ("wfi");
-    }
+    while (true) asm volatile ("wfi");
 }
 
 export fn boot() linksection(".text.boot") callconv(.naked) noreturn {
