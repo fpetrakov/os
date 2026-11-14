@@ -10,10 +10,15 @@ export fn kernel_main() noreturn {
     const bss_len = @intFromPtr(bss_end) - @intFromPtr(bss);
     @memset(bss[0..bss_len], 0);
 
+    const paddr0 = alloc_pages(2);
+    const paddr1 = alloc_pages(1);
+    common.printf("alloc_pages test0: paddr0={*} ({})\n", .{ paddr0.ptr, paddr0.len });
+    common.printf("alloc_pages test1: paddr1={*} ({})\n", .{ paddr1.ptr, paddr1.len });
+
     common.printf("\n\nHello {s}\n", .{"Kernel!"});
 
     write_csr("stvec", @intFromPtr(&kernel_entry));
-    asm volatile ("unimp");
+    // asm volatile ("unimp");
 
     while (true) asm volatile ("wfi");
 }
@@ -156,4 +161,25 @@ fn write_csr(comptime reg: []const u8, val: usize) void {
         :
         : [val] "r" (val),
     );
+}
+
+const PAGE_SIZE = 4096;
+const free_ram = @extern([*]u8, .{ .name = "__free_ram" });
+const free_ram_end = @extern([*]u8, .{ .name = "__free_ram_end" });
+
+var used_mem: usize = 0;
+fn alloc_pages(pages: u32) []u8 {
+    const ram = free_ram[0 .. @intFromPtr(free_ram_end) - @intFromPtr(free_ram)];
+    const alloc_size = pages * PAGE_SIZE;
+
+    if (used_mem + alloc_size > ram.len) {
+        @panic("out of memory");
+    }
+
+    const result = ram[used_mem..(used_mem + alloc_size)];
+    used_mem += alloc_size;
+
+    @memset(result, 0);
+
+    return result;
 }
