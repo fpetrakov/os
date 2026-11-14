@@ -42,7 +42,7 @@ pub fn panic(
     _ = error_return_trace;
     _ = ret_addr;
 
-    writer.print("PANIC: {s}\n", .{msg}) catch {};
+    writer.print("KERNEL PANIC: {s}\n", .{msg}) catch {};
     while (true) asm volatile ("");
 }
 

@@ -10,15 +10,22 @@ export fn kernelMain() noreturn {
     const bss_len = @intFromPtr(bss_end) - @intFromPtr(bss);
     @memset(bss[0..bss_len], 0);
 
+    common.printf("\n\nHello {s}\n", .{"Kernel!"});
+
     const paddr0 = allocPages(2);
     const paddr1 = allocPages(1);
     common.printf("alloc_pages test0: paddr0={*} ({})\n", .{ paddr0.ptr, paddr0.len });
     common.printf("alloc_pages test1: paddr1={*} ({})\n", .{ paddr1.ptr, paddr1.len });
 
-    common.printf("\n\nHello {s}\n", .{"Kernel!"});
-
     writeCsr("stvec", @intFromPtr(&kernelEntry));
     // asm volatile ("unimp");
+
+    idle_proc = createProcess(undefined);
+    _ = createProcess(&processA);
+    _ = createProcess(&processB);
+    current_proc = idle_proc;
+    yield();
+    panic("switched to idle process", null, null);
 
     while (true) asm volatile ("wfi");
 }
@@ -32,6 +39,8 @@ export fn boot() linksection(".text.boot") callconv(.naked) void {
 
 export fn kernelEntry() align(4) callconv(.naked) void {
     asm volatile (
+        \\csrrw sp, sscratch, sp
+        \\
         \\addi sp, sp, -4 * 31
         \\sw ra, 4 * 0(sp)
         \\sw gp, 4 * 1(sp)
@@ -66,6 +75,13 @@ export fn kernelEntry() align(4) callconv(.naked) void {
         \\
         \\addi a0, sp, 4 * 31
         \\sw a0, -4(a0)
+        \\
+        // Retrieve and save the sp at the time of exception.
+        \\csrr a0, sscratch
+        \\sw a0,  4 * 30(sp)
+        // Reset the kernel stack.
+        \\addi a0, sp, 4 * 31
+        \\csrw sscratch, a0
         \\
         \\mv a0, sp
         \\call handleTrap
@@ -186,8 +202,127 @@ fn allocPages(pages: u32) []u8 {
 
 const Process = struct {
     pid: usize = 0,
-    state: enum { unused, runnable } = .runnable,
+    state: enum { unused, runnable } = .unused,
     sp: *usize = undefined,
     stack: [8192]u8 align(4) = undefined,
 };
-var procs: [8]Process = @splat(Process{});
+const procs_max = 8;
+var procs: [procs_max]Process = @splat(Process{});
+
+noinline fn switchContext(prev_sp: **usize, next_sp: **usize) align(4) callconv(.c) void {
+    asm volatile (
+        \\addi sp, sp, -13 * 4
+        \\sw ra,  0  * 4(sp)
+        \\sw s0,  1  * 4(sp)
+        \\sw s1,  2  * 4(sp)
+        \\sw s2,  3  * 4(sp)
+        \\sw s3,  4  * 4(sp)
+        \\sw s4,  5  * 4(sp)
+        \\sw s5,  6  * 4(sp)
+        \\sw s6,  7  * 4(sp)
+        \\sw s7,  8  * 4(sp)
+        \\sw s8,  9  * 4(sp)
+        \\sw s9,  10 * 4(sp)
+        \\sw s10, 11 * 4(sp)
+        \\sw s11, 12 * 4(sp)
+        \\
+        \\sw sp, (%[prev_sp])
+        \\lw sp, (%[next_sp])
+        \\
+        \\lw ra,  0  * 4(sp)
+        \\lw s0,  1  * 4(sp)
+        \\lw s1,  2  * 4(sp)
+        \\lw s2,  3  * 4(sp)
+        \\lw s3,  4  * 4(sp)
+        \\lw s4,  5  * 4(sp)
+        \\lw s5,  6  * 4(sp)
+        \\lw s6,  7  * 4(sp)
+        \\lw s7,  8  * 4(sp)
+        \\lw s8,  9  * 4(sp)
+        \\lw s9,  10 * 4(sp)
+        \\lw s10, 11 * 4(sp)
+        \\lw s11, 12 * 4(sp)
+        \\addi sp, sp, 13 * 4
+        \\ret
+        :
+        : [prev_sp] "r" (prev_sp),
+          [next_sp] "r" (next_sp),
+    );
+}
+
+fn createProcess(pc: *const anyopaque) *Process {
+    const p = for (&procs, 0..) |*p, i| {
+        if (p.state == .unused) {
+            p.pid = i;
+            break p;
+        }
+    } else @panic("no free process slots");
+
+    const regs: []usize = blk: {
+        const ptr: [*]usize = @ptrCast(@alignCast(&p.stack));
+        break :blk ptr[0 .. p.stack.len / @sizeOf(usize)];
+    };
+
+    const sp = regs[regs.len - 13 ..];
+    sp[0] = @intFromPtr(pc);
+
+    std.debug.assert(sp.len == 13);
+
+    for (sp[1..]) |*reg| {
+        reg.* = 0;
+    }
+
+    p.sp = &sp.ptr[0];
+    p.state = .runnable;
+    return p;
+}
+
+fn delay() void {
+    for (0..3_000_000_000) |_| asm volatile ("nop");
+}
+
+export fn processA() void {
+    common.printf("starting process A\n\n", .{});
+    while (true) {
+        common.printf("A", .{});
+        yield();
+        delay();
+    }
+}
+
+export fn processB() void {
+    common.printf("starting process B\n\n", .{});
+    while (true) {
+        common.printf("B", .{});
+        yield();
+        delay();
+    }
+}
+
+var current_proc: *Process = undefined;
+var idle_proc: *Process = undefined;
+
+noinline fn yield() void {
+    const start_idx = (current_proc.pid + 1) % procs.len;
+    const next = for (procs[start_idx..]) |*p| {
+        if (p.state == .runnable and p.pid > 0) {
+            break p;
+        }
+    } else for (procs[0..start_idx]) |*p| {
+        if (p.state == .runnable and p.pid > 0) {
+            break p;
+        }
+    } else idle_proc;
+
+    if (next == current_proc) return;
+
+    asm volatile (
+        \\csrw sscratch, %[sscratch]
+        :
+        : [sscratch] "r" (@intFromPtr(&next.stack) + next.stack.len),
+    );
+
+    const prev = current_proc;
+    current_proc = next;
+    switchContext(&prev.sp, &next.sp);
+}
