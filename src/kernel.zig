@@ -6,18 +6,18 @@ const bss = @extern([*]u8, .{ .name = "__bss" });
 const bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
 
-export fn kernel_main() noreturn {
+export fn kernelMain() noreturn {
     const bss_len = @intFromPtr(bss_end) - @intFromPtr(bss);
     @memset(bss[0..bss_len], 0);
 
-    const paddr0 = alloc_pages(2);
-    const paddr1 = alloc_pages(1);
+    const paddr0 = allocPages(2);
+    const paddr1 = allocPages(1);
     common.printf("alloc_pages test0: paddr0={*} ({})\n", .{ paddr0.ptr, paddr0.len });
     common.printf("alloc_pages test1: paddr1={*} ({})\n", .{ paddr1.ptr, paddr1.len });
 
     common.printf("\n\nHello {s}\n", .{"Kernel!"});
 
-    write_csr("stvec", @intFromPtr(&kernel_entry));
+    writeCsr("stvec", @intFromPtr(&kernelEntry));
     // asm volatile ("unimp");
 
     while (true) asm volatile ("wfi");
@@ -26,11 +26,11 @@ export fn kernel_main() noreturn {
 export fn boot() linksection(".text.boot") callconv(.naked) void {
     asm volatile (
         \\la sp, __stack_top
-        \\j kernel_main
+        \\j kernelMain
     );
 }
 
-export fn kernel_entry() align(4) callconv(.naked) void {
+export fn kernelEntry() align(4) callconv(.naked) void {
     asm volatile (
         \\addi sp, sp, -4 * 31
         \\sw ra, 4 * 0(sp)
@@ -68,7 +68,7 @@ export fn kernel_entry() align(4) callconv(.naked) void {
         \\sw a0, -4(a0)
         \\
         \\mv a0, sp
-        \\call handle_trap
+        \\call handleTrap
         \\
         \\lw ra, 4 * 0(sp)
         \\lw gp, 4 * 1(sp)
@@ -139,38 +139,38 @@ const TrapFrame = extern struct {
     sp: usize,
 };
 
-export fn handle_trap(tf: *TrapFrame) void {
+export fn handleTrap(tf: *TrapFrame) void {
     _ = tf;
-    const scause = read_csr("scause");
-    const stval = read_csr("stval");
-    const user_pc = read_csr("sepc");
+    const scause = readCsr("scause");
+    const stval = readCsr("stval");
+    const user_pc = readCsr("sepc");
 
     std.debug.panic("Unexpected trap scause={x}, stval={x}, user_pc={x}", .{
         scause, stval, user_pc,
     });
 }
 
-fn read_csr(comptime reg: []const u8) usize {
+fn readCsr(comptime reg: []const u8) usize {
     return asm ("csrr %[ret], " ++ reg
         : [ret] "=r" (-> usize),
     );
 }
 
-fn write_csr(comptime reg: []const u8, val: usize) void {
+fn writeCsr(comptime reg: []const u8, val: usize) void {
     asm volatile ("csrw " ++ reg ++ ", %[val]"
         :
         : [val] "r" (val),
     );
 }
 
-const PAGE_SIZE = 4096;
+const page_size = 4096;
 const free_ram = @extern([*]u8, .{ .name = "__free_ram" });
 const free_ram_end = @extern([*]u8, .{ .name = "__free_ram_end" });
 
 var used_mem: usize = 0;
-fn alloc_pages(pages: u32) []u8 {
+fn allocPages(pages: u32) []u8 {
     const ram = free_ram[0 .. @intFromPtr(free_ram_end) - @intFromPtr(free_ram)];
-    const alloc_size = pages * PAGE_SIZE;
+    const alloc_size = pages * page_size;
 
     if (used_mem + alloc_size > ram.len) {
         @panic("out of memory");
@@ -183,3 +183,11 @@ fn alloc_pages(pages: u32) []u8 {
 
     return result;
 }
+
+const Process = struct {
+    pid: usize = 0,
+    state: enum { unused, runnable } = .runnable,
+    sp: *usize = undefined,
+    stack: [8192]u8 align(4) = undefined,
+};
+var procs: [8]Process = @splat(Process{});
