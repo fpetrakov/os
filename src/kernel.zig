@@ -2,6 +2,7 @@ const std = @import("std");
 const common = @import("common.zig");
 pub const panic = common.panic;
 
+const kernel_base = @extern([*]u8, .{ .name = "__kernel_base" });
 const bss = @extern([*]u8, .{ .name = "__bss" });
 const bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const stack_top = @extern([*]u8, .{ .name = "__stack_top" });
@@ -12,10 +13,10 @@ export fn kernelMain() noreturn {
 
     common.printf("\n\nHello {s}\n", .{"Kernel!"});
 
-    const paddr0 = allocPages(2);
-    const paddr1 = allocPages(1);
-    common.printf("alloc_pages test0: paddr0={*} ({})\n", .{ paddr0.ptr, paddr0.len });
-    common.printf("alloc_pages test1: paddr1={*} ({})\n", .{ paddr1.ptr, paddr1.len });
+    // const paddr0 = allocPages(2);
+    // const paddr1 = allocPages(1);
+    // common.printf("alloc_pages test0: paddr0={*} ({})\n", .{ paddr0.ptr, paddr0.len });
+    // common.printf("alloc_pages test1: paddr1={*} ({})\n", .{ paddr1.ptr, paddr1.len });
 
     writeCsr("stvec", @intFromPtr(&kernelEntry));
     // asm volatile ("unimp");
@@ -192,7 +193,7 @@ fn allocPages(pages: u32) []u8 {
         @panic("out of memory");
     }
 
-    const result = ram[used_mem..(used_mem + alloc_size)];
+    const result = ram[used_mem..][0..(used_mem + alloc_size)];
     used_mem += alloc_size;
 
     @memset(result, 0);
@@ -204,6 +205,7 @@ const Process = struct {
     pid: usize = 0,
     state: enum { unused, runnable } = .unused,
     sp: *usize = undefined,
+    page_table: [*]PageEntry = undefined,
     stack: [8192]u8 align(4) = undefined,
 };
 const procs_max = 8;
@@ -272,6 +274,26 @@ fn createProcess(pc: *const anyopaque) *Process {
         reg.* = 0;
     }
 
+    const page = allocPages(1);
+    p.page_table = @ptrCast(@alignCast(page));
+
+    common.printf("new top level page table: {*}\n", .{page.ptr});
+
+    const pages_count = @divFloor((@intFromPtr(free_ram_end) - @intFromPtr(kernel_base)), page_size);
+    const pages: [*][page_size]u8 = @ptrCast(kernel_base);
+
+    for (pages[0..pages_count]) |*paddr| {
+        const flags: PageEntry = .{
+            .read = true,
+            .write = true,
+            .execute = true,
+            .user = false,
+            .valid = false,
+        };
+
+        mapPage(p.page_table, @intFromPtr(paddr), @intFromPtr(paddr), flags);
+    }
+
     p.sp = &sp.ptr[0];
     p.state = .runnable;
     return p;
@@ -316,13 +338,83 @@ noinline fn yield() void {
 
     if (next == current_proc) return;
 
+    const satp = Satp.fromPageTableAddr(next.page_table);
+    const satp_u32: u32 = @bitCast(satp);
     asm volatile (
+        \\sfence.vma
+        \\csrw satp, %[satp]
+        \\sfence.vma
         \\csrw sscratch, %[sscratch]
         :
-        : [sscratch] "r" (@intFromPtr(&next.stack) + next.stack.len),
+        : [satp] "r" (satp_u32),
+          [sscratch] "r" (@intFromPtr(&next.stack) + next.stack.len),
     );
 
     const prev = current_proc;
     current_proc = next;
     switchContext(&prev.sp, &next.sp);
+}
+
+// Virtual memory
+
+const Satp = packed struct {
+    reserved: u31,
+    sv32: bool,
+
+    fn fromPageTableAddr(pta: [*]PageEntry) Satp {
+        return .{
+            .reserved = @intCast(@intFromPtr(pta) >> 12),
+            .sv32 = true,
+        };
+    }
+};
+
+const Vpn = packed struct(u32) {
+    offset: u12,
+    zero: u10,
+    one: u10,
+};
+
+const PageEntry = packed struct(u32) {
+    valid: bool,
+    read: bool,
+    write: bool,
+    execute: bool,
+    user: bool,
+    other_flags: u5 = 0,
+    ppn: u22 = 0,
+};
+
+fn mapPage(
+    table1: [*]PageEntry,
+    vaddr: usize,
+    paddr: usize,
+    flags: PageEntry,
+) void {
+    if (vaddr % page_size != 0) {
+        std.debug.panic("unaliged vaddr: {}", .{vaddr});
+    }
+
+    if (paddr % page_size != 0) {
+        std.debug.panic("unaliged paddr: {}", .{paddr});
+    }
+
+    const vpn: Vpn = @bitCast(vaddr);
+
+    if (!table1[vpn.one].valid) {
+        var pt_paddr: PageEntry = @bitCast(@intFromPtr(allocPages(1).ptr));
+        pt_paddr.valid = true;
+        pt_paddr.ppn >>= 2;
+        table1[vpn.one] = pt_paddr;
+    }
+
+    const table0u32: u32 = @intCast(table1[vpn.one].ppn);
+    const table0: [*]PageEntry = @ptrFromInt(table0u32 << 12);
+
+    const paddr_as_pe: PageEntry = @bitCast((paddr / page_size) << 10);
+    var new_pe = flags;
+    new_pe.ppn = paddr_as_pe.ppn;
+    new_pe.valid = true;
+
+    table0[vpn.zero] = new_pe;
 }
