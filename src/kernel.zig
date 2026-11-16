@@ -160,7 +160,8 @@ export fn handleTrap(tf: *TrapFrame) void {
     switch (scause) {
         scause_ecall => {
             handleSyscall(tf);
-            writeCsr("sepc", user_pc + 4);
+            const size_of_ecall_ins = 4;
+            writeCsr("sepc", user_pc + size_of_ecall_ins);
         },
         else => {
             std.debug.panic("Unexpected trap scause={x}, stval={x}, user_pc={x}", .{
