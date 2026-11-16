@@ -190,6 +190,7 @@ fn handleSyscall(f: *TrapFrame) void {
             });
 
             current_proc.state = .exited;
+            // we could also free resources used by the process here
             yield();
         },
     }
