@@ -5,7 +5,7 @@ const SbiRet = struct {
     value: isize,
 };
 
-fn sbiCall(
+pub fn sbiCall(
     arg0: isize,
     arg1: isize,
     arg2: isize,
@@ -70,4 +70,8 @@ var writer: std.Io.Writer = .{
 
 pub fn printf(comptime fmt: []const u8, args: anytype) void {
     writer.print(fmt, args) catch unreachable;
+}
+
+pub fn printByte(b: u8) void {
+    writer.writeByte(b) catch unreachable;
 }

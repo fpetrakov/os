@@ -1,6 +1,8 @@
 const std = @import("std");
 const common = @import("common.zig");
 pub const panic = common.panic;
+const shell = @embedFile("shell.bin");
+const user = @import("user.zig");
 
 const kernel_base = @extern([*]u8, .{ .name = "__kernel_base" });
 const bss = @extern([*]u8, .{ .name = "__bss" });
@@ -13,20 +15,13 @@ export fn kernelMain() noreturn {
 
     common.printf("\n\nHello {s}\n", .{"Kernel!"});
 
-    // const paddr0 = allocPages(2);
-    // const paddr1 = allocPages(1);
-    // common.printf("alloc_pages test0: paddr0={*} ({})\n", .{ paddr0.ptr, paddr0.len });
-    // common.printf("alloc_pages test1: paddr1={*} ({})\n", .{ paddr1.ptr, paddr1.len });
-
     writeCsr("stvec", @intFromPtr(&kernelEntry));
     // asm volatile ("unimp");
 
-    idle_proc = createProcess(undefined);
-    _ = createProcess(&processA);
-    _ = createProcess(&processB);
+    idle_proc = createProcess(&.{});
     current_proc = idle_proc;
+    _ = createProcess(shell);
     yield();
-    panic("switched to idle process", null, null);
 
     while (true) asm volatile ("wfi");
 }
@@ -157,14 +152,46 @@ const TrapFrame = extern struct {
 };
 
 export fn handleTrap(tf: *TrapFrame) void {
-    _ = tf;
+    const scause_ecall = 8;
     const scause = readCsr("scause");
     const stval = readCsr("stval");
     const user_pc = readCsr("sepc");
 
-    std.debug.panic("Unexpected trap scause={x}, stval={x}, user_pc={x}", .{
-        scause, stval, user_pc,
-    });
+    switch (scause) {
+        scause_ecall => {
+            handleSyscall(tf);
+            writeCsr("sepc", user_pc + 4);
+        },
+        else => {
+            std.debug.panic("Unexpected trap scause={x}, stval={x}, user_pc={x}", .{
+                scause, stval, user_pc,
+            });
+        },
+    }
+}
+
+fn handleSyscall(f: *TrapFrame) void {
+    const syscall: user.Syscall = @fromBackingInt(@intCast(f.a0));
+    switch (syscall) {
+        .putchar => common.printByte(@intCast(f.a1)),
+        .getchar => while (true) {
+            const ret = common.sbiCall(0, 0, 0, 0, 0, 0, 0, 2);
+            if (ret.err >= 0) {
+                f.a0 = @intCast(ret.err);
+                break;
+            }
+            yield();
+        },
+        .exit => {
+            common.printf("[kernel] Process {} exited with code {}\n", .{
+                current_proc.pid,
+                f.a1,
+            });
+
+            current_proc.state = .exited;
+            yield();
+        },
+    }
 }
 
 fn readCsr(comptime reg: []const u8) usize {
@@ -201,9 +228,10 @@ fn allocPages(pages: u32) []u8 {
     return result;
 }
 
+const user_base = 0x1000000;
 const Process = struct {
     pid: usize = 0,
-    state: enum { unused, runnable } = .unused,
+    state: enum { unused, runnable, exited } = .unused,
     sp: *usize = undefined,
     page_table: [*]PageEntry = undefined,
     stack: [8192]u8 align(4) = undefined,
@@ -252,7 +280,19 @@ noinline fn switchContext(prev_sp: **usize, next_sp: **usize) align(4) callconv(
     );
 }
 
-fn createProcess(pc: *const anyopaque) *Process {
+export fn userEntry() callconv(.naked) void {
+    const sstatus_spie: u32 = 1 << 5;
+    asm volatile (
+        \\csrw sepc, %[sepc]
+        \\csrw sstatus, %[sstatus]
+        \\sret
+        :
+        : [sepc] "r" (user_base),
+          [sstatus] "r" (sstatus_spie),
+    );
+}
+
+fn createProcess(image: []const u8) *Process {
     const p = for (&procs, 0..) |*p, i| {
         if (p.state == .unused) {
             p.pid = i;
@@ -266,7 +306,7 @@ fn createProcess(pc: *const anyopaque) *Process {
     };
 
     const sp = regs[regs.len - 13 ..];
-    sp[0] = @intFromPtr(pc);
+    sp[0] = @intFromPtr(&userEntry);
 
     std.debug.assert(sp.len == 13);
 
@@ -274,10 +314,7 @@ fn createProcess(pc: *const anyopaque) *Process {
         reg.* = 0;
     }
 
-    const page = allocPages(1);
-    p.page_table = @ptrCast(@alignCast(page));
-
-    common.printf("new top level page table: {*}\n", .{page.ptr});
+    p.page_table = @ptrCast(@alignCast(allocPages(1)));
 
     const pages_count = @divFloor((@intFromPtr(free_ram_end) - @intFromPtr(kernel_base)), page_size);
     const pages: [*][page_size]u8 = @ptrCast(kernel_base);
@@ -292,6 +329,20 @@ fn createProcess(pc: *const anyopaque) *Process {
         };
 
         mapPage(p.page_table, @intFromPtr(paddr), @intFromPtr(paddr), flags);
+    }
+
+    var off: usize = 0;
+    while (off < image.len) : (off += page_size) {
+        const page = allocPages(1);
+        const remaining = image.len - off;
+        const copy_size = if (page_size <= remaining) page_size else remaining;
+        @memcpy(page[0..copy_size], image[off..][0..copy_size]);
+        mapPage(p.page_table, user_base + off, @intFromPtr(page.ptr), .{
+            .read = true,
+            .write = true,
+            .execute = true,
+            .user = true,
+        });
     }
 
     p.sp = &sp.ptr[0];
@@ -347,7 +398,7 @@ noinline fn yield() void {
         \\csrw sscratch, %[sscratch]
         :
         : [satp] "r" (satp_u32),
-          [sscratch] "r" (@intFromPtr(&next.stack) + next.stack.len),
+          [sscratch] "r" (next.stack[next.stack.len..].ptr),
     );
 
     const prev = current_proc;
@@ -376,7 +427,7 @@ const Vpn = packed struct(u32) {
 };
 
 const PageEntry = packed struct(u32) {
-    valid: bool,
+    valid: bool = false,
     read: bool,
     write: bool,
     execute: bool,
